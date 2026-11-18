@@ -35,6 +35,10 @@ SCREEN_COLUMNS = (*PERIOD_COLUMNS, *METRIC_COLUMNS, "filters")
 def arguments(argv):
     parser = argparse.ArgumentParser(prog="finautomation", description="Опекс · финансовый анализ эмитентов")
     commands = parser.add_subparsers(dest="command", required=True)
+    web = commands.add_parser("serve", help="Запустить локальный интерфейс аналитика")
+    web.add_argument("--port", default=8765, type=int, help="Локальный HTTP-порт")
+    web.add_argument("--out", default=Path("runs/web"), type=Path, help="Папка веб-запусков")
+    web.add_argument("--examples", default=Path("examples/demo"), type=Path, help="Папка учебных CSV")
     command = commands.add_parser("run", help="Рассчитать показатели и собрать локальный HTML-отчёт")
     command.add_argument("--tickers", required=True, type=Path, help="Список бумаг CSV")
     command.add_argument("--financials", type=Path, action="append", default=[],
@@ -49,6 +53,8 @@ def arguments(argv):
     command.add_argument("--out", required=True, type=Path, help="Каталог для отдельных папок запусков")
     command.add_argument("--synthetic-demo", action="store_true", help="Пометить учебные данные как синтетические")
     args = parser.parse_args(argv)
+    if args.command == "serve":
+        return args
     if not (args.financials or args.online_financials):
         command.error("Укажите --financials или --online-financials")
     if args.period_dates and not args.online_financials:
@@ -182,16 +188,25 @@ def run_pipeline(args, destination, started):
     return ingestion
 
 
+def execute_run(args, *, run_id=None):
+    started = datetime.now(ZoneInfo("Europe/Moscow"))
+    destination = args.out / (run_id or f"{started:%Y%m%d-%H%M%S}-{uuid4().hex[:8]}")
+    args.out.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".opex-", dir=args.out) as temporary:
+        staging = Path(temporary)
+        summary = run_pipeline(args, staging, started)
+        staging.rename(destination)
+    return destination, summary
+
+
 def main(argv=None):
     args = arguments(argv)
-    started = datetime.now(ZoneInfo("Europe/Moscow"))
-    destination = args.out / f"{started:%Y%m%d-%H%M%S}-{uuid4().hex[:8]}"
+    if args.command == "serve":
+        from .web import serve
+
+        return serve(args)
     try:
-        args.out.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix=".opex-", dir=args.out) as temporary:
-            staging = Path(temporary)
-            summary = run_pipeline(args, staging, started)
-            staging.rename(destination)
+        destination, summary = execute_run(args)
     except (OSError, ValueError, yaml.YAMLError) as error:
         print(f"Ошибка запуска: {error}", file=sys.stderr)
         return 2

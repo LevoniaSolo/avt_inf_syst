@@ -1,6 +1,6 @@
 [project]
 name = "finautomation"
-version = "0.2.0"
+version = "0.3.0"
 description = "ОПЕКС: пакетный финансовый анализ эмитентов"
 readme = "README.md"
 authors = [

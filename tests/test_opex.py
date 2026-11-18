@@ -142,6 +142,32 @@ class CalculationsTest(unittest.TestCase):
 
 
 class ForecastTest(unittest.TestCase):
+    def test_quarterly_seasonality_is_selected_using_only_earlier_points(self):
+        seasons = (250, 60, 100, 30)
+        dates = ("03-31", "06-30", "09-30", "12-31")
+        series = [statement(f"{2020 + index // 4}-{dates[index % 4]}",
+                            revenue=100 + 10 * index + seasons[index % 4]) for index in range(13)]
+        rows, stats = forecast_revenue(series, 4)
+        held_out = rows[-2]
+        self.assertEqual(held_out["model"], "seasonal_trend")
+        self.assertAlmostEqual(held_out["forecast"], held_out["y_true"])
+        self.assertNotAlmostEqual(held_out["linear_reference"], held_out["y_true"])
+        changed = [*series[:-1], statement("2023-03-31", revenue=999)]
+        changed_rows, _ = forecast_revenue(changed, 4)
+        self.assertEqual(changed_rows[-2]["model"], held_out["model"])
+        self.assertEqual(changed_rows[-2]["forecast"], held_out["forecast"])
+        self.assertLess(stats["mape_model"], stats["mape_linear_reference"])
+
+    def test_microsoft_history_compares_three_methods_on_the_same_quarters(self):
+        path = ROOT / "examples" / "forecast" / "msft_quarterly.csv"
+        with path.open(encoding="utf-8", newline="") as source:
+            series = [statement(row["period_end"], revenue=int(row["revenue_million_usd"]))
+                      for row in csv.DictReader(source)]
+        _, stats = forecast_revenue(series, 4)
+        self.assertEqual(stats["eligible_points"], 24)
+        self.assertLess(stats["mape_model"], stats["mape_linear_reference"])
+        self.assertLess(stats["mape_model"], stats["mape_naive"])
+
     def test_target_is_excluded_from_its_own_fit(self):
         dates = ("2023-12-31", "2024-03-31", "2024-06-30", "2024-09-30", "2024-12-31")
         series = [statement(day, revenue=value) for day, value in zip(dates, (10, 20, 30, 40, 500))]

@@ -3,7 +3,14 @@ set -euo pipefail
 
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 
-if [[ ! -x .venv/bin/python || ! -x .venv/bin/finautomation ]]; then
+if [[ ! -x .venv/bin/python || ! -x .venv/bin/finautomation ]] || ! .venv/bin/python -c '
+from importlib.metadata import version
+import tomllib
+
+with open("pyproject.toml", "rb") as file:
+    expected = tomllib.load(file)["project"]["version"]
+raise SystemExit(version("finautomation") != expected)
+' 2>/dev/null; then
     if command -v uv >/dev/null 2>&1; then
         uv_command=uv
     else
@@ -15,6 +22,11 @@ if [[ ! -x .venv/bin/python || ! -x .venv/bin/finautomation ]]; then
         fi
     fi
     "$uv_command" sync --locked
+fi
+
+if [[ "${1:-}" == "--web" ]]; then
+    shift
+    exec .venv/bin/python -m finautomation.main serve "$@"
 fi
 
 exec .venv/bin/python -m finautomation.main run \

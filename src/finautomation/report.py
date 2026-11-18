@@ -4,6 +4,7 @@ import json
 from collections import defaultdict
 from html import escape
 
+from .forecast import MODEL_LABELS
 from .inputs import PERIOD_COLUMNS
 from .metrics import SCENARIO_FIELDS
 
@@ -61,6 +62,14 @@ th{background:#f4f7fc;white-space:nowrap}td:nth-child(2){min-width:70px}td{overf
 details{margin:.35em 0}details.period{border-top:1px solid #dae0ea;padding:10px 0}
 summary{cursor:pointer;color:#174aa1;font-weight:600}.inputs{padding-left:1.25rem;font-size:.9rem}
 nav ul{display:flex;flex-wrap:wrap;gap:8px 24px;padding-left:18px}.status{color:#5d4c32}
+@media(prefers-color-scheme:dark){
+  :root{color-scheme:dark;color:#edf1fc;background:#101725}
+  h1,h2,h3,h4{color:#eef2fd}
+  a,summary{color:#aab6ff}a:focus-visible,summary:focus-visible{outline-color:#aab6ff}
+  section,header,article{background:#182235;border-color:#34415a}
+  .summary{color:#acb9d1}.warning{border-color:#ffc783;background:#443422}.status{color:#f2cea8}
+  th{background:#202c43}th,td{border-color:#34415a}details.period{border-color:#34415a}
+}
 """
 
 
@@ -203,9 +212,10 @@ def make_report(results, screened, scenarios, forecasts, stats, settings):
         latest = [latest_forecasts[(*identity, frequency)] for frequency in ("Q", "FY")
                   if (*identity, frequency) in latest_forecasts]
         blocks.append("<h4>Прогноз выручки</h4>" + table(
-            ("Период", "Целевая дата", "Прогноз", "Naive", "Дата Naive", "Рост", "Статус"),
+            ("Период", "Целевая дата", "Прогноз", "Метод", "Naive", "Дата Naive", "Рост", "Статус"),
             ([html(row["period_type"]), html(row["target_period_end"]), display(row["forecast"]),
-              display(row["naive"]), display(row["naive_period_end"]), display(row["forecast_growth"], "forecast_growth"),
+              display(MODEL_LABELS.get(row["model"])), display(row["naive"]), display(row["naive_period_end"]),
+              display(row["forecast_growth"], "forecast_growth"),
               html(STATUSES.get(row["reason"] or row["status"], row["reason"] or row["status"]))] for row in latest),
         ))
         for index, period in enumerate(reversed(periods)):
@@ -231,10 +241,11 @@ def make_report(results, screened, scenarios, forecasts, stats, settings):
     for kind, label in (("Q", "Квартал"), ("FY", "Год")):
         result = forecast["by_period_type"][kind]
         frequency_rows.append((
-            label, display(result["mape_model"], "forecast_growth"), display(result["mape_naive"], "forecast_growth"),
+            label, display(result["mape_model"], "forecast_growth"),
+            display(result["mape_linear_reference"], "forecast_growth"), display(result["mape_naive"], "forecast_growth"),
             html(result["eligible_points"]), html(STATUSES[result["status"]]),
         ))
-    frequency_scores = table(("Период", "MAPE модели", "MAPE Naive", "Точек", "Статус"), frequency_rows)
+    frequency_scores = table(("Период", "MAPE модели", "Базовый тренд", "MAPE Naive", "Точек", "Статус"), frequency_rows)
     if stats["synthetic_demo"]:
         input_type = "Учебный синтетический набор"
     elif stats["financials_mode"] == "yahoo":
