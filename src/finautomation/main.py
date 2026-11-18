@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 import yaml
 
 from .config import load_settings
+from .financials import ONLINE_FINANCIAL_COLUMNS, fetch_financials, read_period_dates
 from .forecast import FORECAST_COLUMNS, forecast_revenue
 from .inputs import (
     INSTRUMENT_COLUMNS, LOG_COLUMNS, PERIOD_COLUMNS, QUOTE_COLUMNS, log_entry, parse_tickers,
@@ -36,14 +37,23 @@ def arguments(argv):
     commands = parser.add_subparsers(dest="command", required=True)
     command = commands.add_parser("run", help="Рассчитать показатели и собрать локальный HTML-отчёт")
     command.add_argument("--tickers", required=True, type=Path, help="Список бумаг CSV")
-    command.add_argument("--financials", required=True, type=Path, help="Подготовленная отчётность CSV")
+    command.add_argument("--financials", type=Path, action="append", default=[],
+                         help="Подготовленная отчётность CSV. Можно указать несколько раз")
+    command.add_argument("--online-financials", action="store_true",
+                         help="Загрузить отчётность Yahoo Finance для бумаг без локальной отчётности")
+    command.add_argument("--period-dates", type=Path, help="Точные даты отчётов для --online-financials, CSV")
     source = command.add_mutually_exclusive_group(required=True)
     source.add_argument("--quotes", type=Path, help="Подготовленные котировки CSV")
     source.add_argument("--online", action="store_true", help="Загрузить дневные цены с указанных площадок")
     command.add_argument("--config", required=True, type=Path, help="Параметры запуска YAML")
     command.add_argument("--out", required=True, type=Path, help="Каталог для отдельных папок запусков")
     command.add_argument("--synthetic-demo", action="store_true", help="Пометить учебные данные как синтетические")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not (args.financials or args.online_financials):
+        command.error("Укажите --financials или --online-financials")
+    if args.period_dates and not args.online_financials:
+        command.error("--period-dates используется вместе с --online-financials")
+    return args
 
 
 def screen(results, settings):
@@ -97,14 +107,21 @@ def snapshot(args, destination):
     folder.mkdir()
     files = {
         "tickers": (args.tickers, folder / "tickers.csv"),
-        "financials": (args.financials, folder / "financials.csv"),
         "config": (args.config, folder / "config.yaml"),
     }
+    if args.period_dates is not None:
+        files["period_dates"] = (args.period_dates, folder / "period_dates.csv")
     if args.quotes is not None:
         files["quotes"] = (args.quotes, folder / "quotes.csv")
     for source, target in files.values():
         shutil.copyfile(source, target)
-    return {key: target for key, (_, target) in files.items()}
+    snapshots = {key: target for key, (_, target) in files.items()}
+    snapshots["financials"] = []
+    for index, source in enumerate(args.financials, 1):
+        target = folder / ("financials.csv" if index == 1 else f"financials_{index}.csv")
+        shutil.copyfile(source, target)
+        snapshots["financials"].append(target)
+    return snapshots
 
 
 def run_pipeline(args, destination, started):
@@ -113,7 +130,18 @@ def run_pipeline(args, destination, started):
     log = []
     settings = load_settings(files["config"])
     requested = parse_tickers(files["tickers"], log)
-    statements = read_records(files["financials"], requested, log, statements=True)
+    local_pairs = set()
+    statements = read_records(files["financials"], requested, log, statements=True, seen=local_pairs)
+    financials_mode = "csv"
+    if args.online_financials:
+        dates = read_period_dates(files["period_dates"], requested, log) if args.period_dates else {}
+        missing = {pair: row for pair, row in requested.items() if pair not in local_pairs}
+        financials_mode = "mixed" if args.financials else "yahoo"
+        filename = "financials_yahoo.csv" if args.financials else "financials.csv"
+        online_path = destination / "inputs" / filename
+        downloaded = fetch_financials(missing, settings, started.date(), dates, log)
+        write_csv(online_path, ONLINE_FINANCIAL_COLUMNS, downloaded)
+        statements.extend(read_records(online_path, missing, log, statements=True))
     if args.online:
         files["quotes"] = destination / "inputs" / "quotes.csv"
         fetched = fetch_online(statements, settings, log)
@@ -127,6 +155,7 @@ def run_pipeline(args, destination, started):
     stats = {
         "version": version("finautomation"), "started_at": started.isoformat(timespec="seconds"),
         "quote_mode": "online" if args.online else "csv", "synthetic_demo": args.synthetic_demo,
+        "financials_mode": financials_mode,
         "ingestion": ingestion, "screener": screen_stats, "forecast": forecast_stats,
         "pe_divergence": {"threshold": float(PE_ALERT_THRESHOLD), "alerts": len(alerts)},
         "elapsed_seconds": round(time.monotonic() - clock, 3),

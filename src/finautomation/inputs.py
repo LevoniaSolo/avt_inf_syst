@@ -25,7 +25,7 @@ PERIOD_COLUMNS = (*INSTRUMENT_COLUMNS, "period_type", "period_end")
 PROVENANCE_COLUMNS = ("source_ref", "retrieved_at")
 FINANCIAL_COLUMNS = (*PERIOD_COLUMNS, *FINANCIAL_FIELDS, *PROVENANCE_COLUMNS)
 QUOTE_COLUMNS = (*INSTRUMENT_COLUMNS, "date", "close", *PROVENANCE_COLUMNS, "close_source_field", "price_scale")
-LOG_COLUMNS = ("row", *INSTRUMENT_COLUMNS, "stage", "status", "reason")
+LOG_COLUMNS = ("row", *INSTRUMENT_COLUMNS, "stage", "status", "reason", "input_file")
 
 
 @dataclass(frozen=True, order=True)
@@ -52,6 +52,7 @@ class Observation:
     source_field: str | None = None
     formula: str | None = None
     operands: tuple["Observation", ...] = ()
+    source_period_end: date | None = None
 
     def trace(self):
         trace = {
@@ -66,6 +67,8 @@ class Observation:
             "date": self.observed_on,
             "reason": self.reason,
         }
+        if self.source_period_end is not None:
+            trace["source_period_end"] = self.source_period_end
         if self.formula:
             trace.update(
                 formula=self.formula, status=self.reason or "ok",
@@ -106,10 +109,10 @@ class Quote:
         }
 
 
-def log_entry(stage, status, reason="", *, row=None, source="", ticker="", currency=""):
+def log_entry(stage, status, reason="", *, row=None, source="", ticker="", currency="", input_file=""):
     return {
         "row": row, "source": source, "ticker": ticker, "currency": currency,
-        "stage": stage, "status": status, "reason": reason,
+        "stage": stage, "status": status, "reason": reason, "input_file": input_file,
     }
 
 
@@ -221,20 +224,36 @@ def fiscal_period(record, kind, day):
     return year, int(quarter) if quarter else None, basis
 
 
-def read_records(path, requested, log, *, statements):
+def input_rows(paths, required):
+    for path in paths:
+        for row, record in read_csv(path, required):
+            yield path, row, record
+
+
+def read_records(paths, requested, log, *, statements, seen=None):
+    if isinstance(paths, Path):
+        paths = (paths,)
     stage = "financials" if statements else "quotes"
     required = PERIOD_COLUMNS if statements else (*INSTRUMENT_COLUMNS, "date", "close")
     grouped = defaultdict(list)
-    for row, record in read_csv(path, required):
-        context = {"row": row, **{key: record.get(key) or "" for key in INSTRUMENT_COLUMNS}}
+    for path, row, record in input_rows(paths, required):
+        context = {"row": row, "input_file": path.name, **{key: record.get(key) or "" for key in INSTRUMENT_COLUMNS}}
         try:
             if None in record:
                 raise ValueError(record[None])
             instrument = parse_instrument(record)
-            if (instrument.source, instrument.ticker) not in requested:
+            pair = (instrument.source, instrument.ticker)
+            if pair not in requested:
                 continue
+            if seen is not None:
+                seen.add(pair)
             context.update(instrument.columns())
             observed_on = iso_date(record["period_end" if statements else "date"])
+            source_period_end = record.get("source_period_end") if statements else None
+            if source_period_end:
+                source_period_end = iso_date(source_period_end)
+            else:
+                source_period_end = None
             source_ref = (record.get("source_ref") or "").strip() or path.name
             retrieved_at = (record.get("retrieved_at") or "").strip()
             if retrieved_at:
@@ -260,7 +279,7 @@ def read_records(path, requested, log, *, statements):
                     log.append(log_entry(stage, reason, field, **context))
                 source_field = (record.get(f"{field}_source_field") or "").strip() or field
                 return Observation(field, value, raw, source_ref, retrieved_at, row, observed_on, reason,
-                                   scale, source_field)
+                                   scale, source_field, source_period_end=source_period_end)
 
             if statements:
                 kind = (record["period_type"] or "").strip().upper()

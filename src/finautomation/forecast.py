@@ -1,7 +1,8 @@
 """Chronological revenue forecasting and like-for-like evaluation."""
 
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
+from statistics import mean
 
 from sklearn.linear_model import LinearRegression
 
@@ -90,7 +91,8 @@ def forecast_revenue(statements, minimum):
 
 def score(rows, minimum):
     backtests = [row for row in rows if row["kind"] == "backtest"]
-    scored = []
+    totals = Counter(row["period_type"] for row in backtests)
+    scored = defaultdict(list)
     for row in backtests:
         if row["mape_excluded"]:
             continue
@@ -98,22 +100,23 @@ def score(rows, minimum):
         model_ape = abs(row["forecast"] - actual) / actual
         naive_ape = abs(row["naive"] - actual) / actual
         if math.isfinite(model_ape) and math.isfinite(naive_ape):
-            scored.append((model_ape, naive_ape))
+            scored[row["period_type"]].append((model_ape, naive_ape))
         else:
             row["mape_excluded"] = True
             row["mape_exclusion_reason"] = "nonfinite_error"
-    count = len(scored)
-    def mean(errors):
-        scale = max(errors)
-        return (math.fsum(value / scale for value in errors) / count) * scale if scale else 0.0
 
-    model = mean([item[0] for item in scored]) if count else None
-    naive = mean([item[1] for item in scored]) if count else None
-    status = "not_evaluable"
-    if count:
-        status = "pass" if model <= 0.20 or model < naive else "fail"
+    def summary(points, total):
+        count = len(points)
+        model = mean(item[0] for item in points) if count else None
+        naive = mean(item[1] for item in points) if count else None
+        status = ("pass" if model <= 0.20 or model < naive else "fail") if count else "not_evaluable"
+        return {
+            "mape_model": model, "mape_naive": naive, "eligible_points": count,
+            "excluded_points": total - count, "status": status,
+        }
+
     return {
         "model": "linear_trend", "minimum_training_periods": minimum, "threshold_mape": 0.20,
-        "mape_model": model, "mape_naive": naive, "eligible_points": count,
-        "excluded_points": len(backtests) - count, "status": status,
+        **summary([point for points in scored.values() for point in points], len(backtests)),
+        "by_period_type": {kind: summary(scored[kind], totals[kind]) for kind in ("Q", "FY")},
     }

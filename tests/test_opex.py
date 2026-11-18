@@ -10,8 +10,10 @@ from unittest.mock import patch
 from urllib.error import URLError
 
 from finautomation.config import load_settings
+from finautomation.financials import fetch_financials, read_period_dates
 from finautomation.forecast import forecast_revenue
 from finautomation.inputs import FINANCIAL_FIELDS, Instrument, Observation, Quote, Statement, parse_tickers, read_records
+from finautomation.main import main
 from finautomation.metrics import analyze, scenario
 from finautomation.quotes import fetch_online, moex_quotes, yahoo_quotes
 
@@ -148,6 +150,8 @@ class ForecastTest(unittest.TestCase):
         self.assertEqual(rows[-2]["naive"], 40)
         self.assertEqual(rows[-2]["y_true"], 500)
         self.assertEqual(stats["eligible_points"], 1)
+        self.assertEqual(stats["by_period_type"]["Q"]["eligible_points"], 1)
+        self.assertEqual(stats["by_period_type"]["FY"]["status"], "not_evaluable")
         self.assertEqual(rows[-1]["target_period_end"], date(2025, 3, 31))
         self.assertIsNone(rows[-1]["y_true"])
         self.assertTrue(rows[-1]["mape_excluded"])
@@ -225,6 +229,141 @@ class InputsTest(unittest.TestCase):
             self.assertEqual([(row["row"], row["status"]) for row in log], [(2, "invalid_row")])
             self.assertEqual(statements[0].fields["revenue"].source_ref, "Annual report\npage 7")
             self.assertEqual(statements[1].fields["revenue"].row, 4)
+
+
+class OnlineFinancialsTest(unittest.TestCase):
+    @staticmethod
+    def series(name, *amounts, ticker="CHECK"):
+        records = [
+            {"asOfDate": day, "periodType": duration, "currencyCode": currency,
+             "reportedValue": {"raw": raw, "fmt": "formatted"}}
+            for day, duration, currency, raw in amounts
+        ]
+        return {"meta": {"type": [name], "symbol": [ticker]}, name: records}
+
+    def test_downloaded_statements_feed_pipeline_and_use_exact_price_cutoff(self):
+        day = "2025-09-30"
+        statements = [
+            self.series("quarterlyTotalRevenue", (day, "3M", "USD", 500),
+                        (day, "12M", "USD", 999)),
+            self.series("quarterlyOperatingIncome", (day, "3M", "USD", 100)),
+            self.series("quarterlyDepreciationAndAmortization", (day, "3M", "USD", 20)),
+            self.series("quarterlyTaxProvision", (day, "3M", "USD", 18)),
+            self.series("quarterlyPretaxIncome", (day, "3M", "USD", 90)),
+            self.series("quarterlyOrdinarySharesNumber", (day, "3M", "USD", 10)),
+            self.series("annualTotalRevenue", (day, "12M", "USD", 2200)),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "tickers.csv").write_text("ticker,market\nCHECK,yahoo\nSBER,moex\n")
+            (root / "quotes.csv").write_text(
+                "source,ticker,currency,date,close\n"
+                "yahoo,CHECK,USD,2025-09-26,20\nyahoo,CHECK,USD,2025-09-30,99\n"
+            )
+            (root / "dates.csv").write_text(
+                "ticker,currency,period_type,source_period_end,period_end\nCHECK,USD,Q,2025-09-30,2025-09-27\n"
+            )
+            with patch("finautomation.financials.get_json",
+                       return_value={"timeseries": {"result": statements, "error": None}}) as fetch:
+                result = main([
+                    "run", "--tickers", str(root / "tickers.csv"), "--online-financials",
+                    "--period-dates", str(root / "dates.csv"), "--quotes", str(root / "quotes.csv"),
+                    "--config", str(EXAMPLES / "config.yaml"), "--out", str(root / "runs"),
+                ])
+            self.assertEqual(result, 0)
+            fetch.assert_called_once()
+            (output,) = (root / "runs").iterdir()
+            quarterly, annual = columns(output / "issuer_metrics.csv")
+            self.assertEqual((quarterly["period_type"], quarterly["period_end"], quarterly["price"]),
+                             ("Q", "2025-09-27", "20.0"))
+            self.assertEqual(float(quarterly["ebitda"]), 120)
+            self.assertEqual(float(quarterly["effective_tax_rate"]), 0.2)
+            self.assertEqual(float(quarterly["market_cap"]), 200)
+            self.assertEqual(float(annual["revenue"]), 2200)
+            traces = columns(output / "formula_trace.csv")
+            revenue = next(row for row in traces if row["period_type"] == "Q" and row["metric"] == "revenue")
+            raw = json.loads(revenue["inputs"])["1. revenue"]
+            self.assertEqual((raw["source_field"], raw["source_period_end"], raw["raw"]),
+                             ("quarterlyTotalRevenue", day, "500"))
+            self.assertIn("requires_csv", {row["status"] for row in columns(output / "parse_log.csv")})
+            self.assertEqual(json.loads((output / "metrics.json").read_text())["financials_mode"], "yahoo")
+            self.assertTrue((output / "inputs" / "period_dates.csv").is_file())
+
+    def test_conflicts_wrong_symbol_and_missing_fields_do_not_fabricate_values(self):
+        requested = {("yahoo", "OTHER"): 2, ("yahoo", "CHECK"): 3}
+        payloads = [
+            {"timeseries": {"error": None, "result": [
+                self.series("annualTotalRevenue", ("2024-12-31", "12M", "USD", 10)),
+            ]}},
+            {"timeseries": {"error": None, "result": [
+                self.series("annualTotalRevenue", ("2024-12-31", "12M", "USD", 50),
+                            ("2024-12-31", "12M", "USD", 55), ("2024-12-31", "12M", "CAD", 65),
+                            ("2025-12-31", "12M", "USD", 70), ("2026-12-31", "12M", "USD", 80)),
+                self.series("annualTaxProvision", ("2025-12-31", "12M", "USD", None)),
+            ]}},
+        ]
+        log = []
+        with patch("finautomation.financials.get_json", side_effect=payloads):
+            rows = fetch_financials(requested, load_settings(EXAMPLES / "config.yaml"), date(2026, 6, 30), {}, log)
+        self.assertEqual([(row["ticker"], row["currency"], row["revenue"]) for row in rows],
+                         [("CHECK", "CAD", 65), ("CHECK", "USD", 70)])
+        self.assertNotIn("income_tax_expense", rows[1])
+        self.assertEqual({entry["status"] for entry in log}, {"conflict", "ok", "source_unavailable"})
+
+    def test_conflicting_report_dates_block_period(self):
+        requested = {("yahoo", "CHECK"): 2}
+        with tempfile.TemporaryDirectory() as temporary:
+            file = Path(temporary) / "dates.csv"
+            file.write_text(
+                "ticker,currency,period_type,source_period_end,period_end\n"
+                "CHECK,USD,Q,2025-09-30,2025-09-27\nCHECK,USD,Q,2025-09-30,2025-09-28\n"
+            )
+            log = []
+            dates = read_period_dates(file, requested, log)
+            payload = {"timeseries": {"error": None, "result": [
+                self.series("quarterlyTotalRevenue", ("2025-09-30", "3M", "USD", 500)),
+            ]}}
+            with patch("finautomation.financials.get_json", return_value=payload):
+                rows = fetch_financials(requested, load_settings(EXAMPLES / "config.yaml"), date(2026, 6, 30),
+                                        dates, log)
+            self.assertEqual(rows, [])
+            self.assertIn("conflict", {entry["status"] for entry in log})
+
+    def test_local_reports_take_precedence_and_mixed_snapshots_replay(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tickers = root / "tickers.csv"
+            financials = root / "financials.csv"
+            quotes = root / "quotes.csv"
+            tickers.write_text("ticker,market\nCHECK,yahoo\nLOCAL,yahoo\nSBER,moex\n")
+            financials.write_text(
+                "source,ticker,currency,period_type,period_end,revenue\n"
+                "moex,SBER,RUB,FY,2024-12-31,10\nyahoo,LOCAL,USD,FY,2024-12-31,20\n"
+            )
+            quotes.write_text(
+                "source,ticker,currency,date,close\n"
+                "moex,SBER,RUB,2024-12-30,9\nyahoo,LOCAL,USD,2024-12-30,8\nyahoo,CHECK,USD,2024-12-30,7\n"
+            )
+            payload = {"timeseries": {"error": None, "result": [
+                self.series("annualTotalRevenue", ("2024-12-31", "12M", "USD", 30)),
+            ]}}
+            base_args = [
+                "run", "--tickers", str(tickers), "--quotes", str(quotes), "--config", str(EXAMPLES / "config.yaml"),
+            ]
+            with patch("finautomation.financials.get_json", return_value=payload) as fetch:
+                self.assertEqual(main([*base_args, "--financials", str(financials), "--online-financials",
+                                       "--out", str(root / "mixed")]), 0)
+            fetch.assert_called_once()
+            (mixed,) = (root / "mixed").iterdir()
+            stats = json.loads((mixed / "metrics.json").read_text())
+            self.assertEqual(stats["financials_mode"], "mixed")
+            self.assertEqual(stats["ingestion"]["with_quotes"], 3)
+            self.assertEqual(main([
+                *base_args, "--financials", str(mixed / "inputs" / "financials.csv"),
+                "--financials", str(mixed / "inputs" / "financials_yahoo.csv"), "--out", str(root / "replayed"),
+            ]), 0)
+            (replay,) = (root / "replayed").iterdir()
+            self.assertEqual((mixed / "issuer_metrics.csv").read_bytes(), (replay / "issuer_metrics.csv").read_bytes())
 
 
 class CliTest(unittest.TestCase):

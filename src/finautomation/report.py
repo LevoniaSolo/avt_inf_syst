@@ -100,6 +100,8 @@ def details_inputs(inputs):
         if value.get("scale") not in (None, 1):
             parts.append(f'масштаб ×{display(value["scale"])}')
         parts.extend(html(value[name]) for name in ("date", "source_ref") if value[name])
+        if value.get("source_period_end") and value["source_period_end"] != value["date"]:
+            parts.append(f'дата периода в источнике {html(value["source_period_end"])}')
         if value["row"]:
             parts.append(f'строка {value["row"]}')
         if value["retrieved_at"]:
@@ -225,7 +227,22 @@ def make_report(results, screened, scenarios, forecasts, stats, settings):
         f'Допустимых точек {forecast["eligible_points"]}, исключено {forecast["excluded_points"]}. '
         f'{html(STATUSES[forecast["status"]])}.'
     )
-    input_type = "Учебный синтетический набор" if stats["synthetic_demo"] else "Отчёт по входным данным"
+    frequency_rows = []
+    for kind, label in (("Q", "Квартал"), ("FY", "Год")):
+        result = forecast["by_period_type"][kind]
+        frequency_rows.append((
+            label, display(result["mape_model"], "forecast_growth"), display(result["mape_naive"], "forecast_growth"),
+            html(result["eligible_points"]), html(STATUSES[result["status"]]),
+        ))
+    frequency_scores = table(("Период", "MAPE модели", "MAPE Naive", "Точек", "Статус"), frequency_rows)
+    if stats["synthetic_demo"]:
+        input_type = "Учебный синтетический набор"
+    elif stats["financials_mode"] == "yahoo":
+        input_type = "Отчётность Yahoo Finance"
+    elif stats["financials_mode"] == "mixed":
+        input_type = "Отчётность из CSV и Yahoo Finance"
+    else:
+        input_type = "Отчёт по входным данным"
     changes = settings.scenario
     return f"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -235,7 +252,8 @@ def make_report(results, screened, scenarios, forecasts, stats, settings):
 <a href="formula_trace.csv">След расчёта CSV</a></header>
 <main><section><h2>Скринер</h2><p>{parameters}. Бумаг в списке {summary["requested"]},
 обработано {summary["processed"]}, прошли отбор {stats["screener"]["passed_instruments"]}.</p>{table_html}</section>
-<section><h2>Проверка прогноза</h2><p>{score_line}</p><a href="forecast_next_period.csv">Прогноз и контрольные точки CSV</a></section>
+<section><h2>Проверка прогноза</h2><p>{score_line}</p>{frequency_scores}
+<a href="forecast_next_period.csv">Прогноз и контрольные точки CSV</a></section>
 <section><h2>Параметры сценария</h2><p>Выручка {changes['r']:+.2%}, маржа EBITDA {changes['m'] * 100:+g} п. п.,
 долг {display(changes['delta_d'])} в валюте отчётности.</p></section>
 <nav aria-label="Карточки эмитентов"><ul>{''.join(nav)}</ul></nav>{''.join(cards)}</main></body></html>
